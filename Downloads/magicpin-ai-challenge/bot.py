@@ -5,6 +5,7 @@ import re
 import urllib.request
 import urllib.error
 from datetime import datetime
+from concurrent.futures import ThreadPoolExecutor
 from fastapi import FastAPI, HTTPException
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel
@@ -387,33 +388,30 @@ def parse_json_from_llm(output: str) -> Optional[Dict[str, Any]]:
         return None
 
 
-@app.post("/v1/tick")
-async def tick(body: TickBody):
-    actions = []
-    for trg_id in body.available_triggers:
-        trg_ctx = contexts.get(("trigger", trg_id))
-        if not trg_ctx:
-            continue
-        trg = trg_ctx["payload"]
-        merchant_id = trg.get("merchant_id")
-        merchant_ctx = contexts.get(("merchant", merchant_id))
-        if not merchant_ctx:
-            continue
-        merchant = merchant_ctx["payload"]
+def process_trigger(trg_id: str) -> Optional[Dict[str, Any]]:
+    trg_ctx = contexts.get(("trigger", trg_id))
+    if not trg_ctx:
+        return None
+    trg = trg_ctx["payload"]
+    merchant_id = trg.get("merchant_id")
+    merchant_ctx = contexts.get(("merchant", merchant_id))
+    if not merchant_ctx:
+        return None
+    merchant = merchant_ctx["payload"]
 
-        cat_slug = merchant.get("category_slug")
-        category_ctx = contexts.get(("category", cat_slug))
-        category = category_ctx["payload"] if category_ctx else {}
+    cat_slug = merchant.get("category_slug")
+    category_ctx = contexts.get(("category", cat_slug))
+    category = category_ctx["payload"] if category_ctx else {}
 
-        customer_id = trg.get("customer_id")
-        customer = None
-        if customer_id:
-            cust_ctx = contexts.get(("customer", customer_id))
-            if cust_ctx:
-                customer = cust_ctx["payload"]
+    customer_id = trg.get("customer_id")
+    customer = None
+    if customer_id:
+        cust_ctx = contexts.get(("customer", customer_id))
+        if cust_ctx:
+            customer = cust_ctx["payload"]
 
-        # 1. Try LLM Call
-        system_prompt = """
+    # 1. Try LLM Call
+    system_prompt = """
 You are "Vera", magicpin's merchant-AI assistant. You write highly engaging, specific, and personalized WhatsApp messages to merchants (or their customers on their behalf).
 
 CONSTRAINTS & RULES:
@@ -438,7 +436,7 @@ CONSTRAINTS & RULES:
    - "rationale": Short explanation of why this message, what it should achieve.
 """
 
-        prompt = f"""
+    prompt = f"""
 CategoryContext: {json.dumps(category)}
 MerchantContext: {json.dumps(merchant)}
 TriggerContext: {json.dumps(trg)}
@@ -446,54 +444,64 @@ CustomerContext: {json.dumps(customer) if customer else "None"}
 
 Please compose the WhatsApp message based on the rules and input contexts above.
 """
-        composed = None
-        llm_output = call_llm(system_prompt, prompt)
-        if llm_output:
-            composed = parse_json_from_llm(llm_output)
+    composed = None
+    llm_output = call_llm(system_prompt, prompt)
+    if llm_output:
+        composed = parse_json_from_llm(llm_output)
 
-        if not composed:
-            composed = fallback_compose(category, merchant, trg, customer)
+    if not composed:
+        composed = fallback_compose(category, merchant, trg, customer)
 
-        conv_id = f"conv_{merchant_id}_{trg_id}"
-        conversation_metadata[conv_id] = {
-            "merchant_id": merchant_id,
-            "customer_id": customer_id,
-            "trigger_id": trg_id
-        }
+    conv_id = f"conv_{merchant_id}_{trg_id}"
+    conversation_metadata[conv_id] = {
+        "merchant_id": merchant_id,
+        "customer_id": customer_id,
+        "trigger_id": trg_id
+    }
 
-        conversation_history.setdefault(conv_id, []).append({
-            "from": "vera" if composed.get("send_as") == "vera" else "merchant_on_behalf",
-            "body": composed.get("body", ""),
-            "timestamp": datetime.utcnow().isoformat() + "Z"
-        })
+    conversation_history.setdefault(conv_id, []).append({
+        "from": "vera" if composed.get("send_as") == "vera" else "merchant_on_behalf",
+        "body": composed.get("body", ""),
+        "timestamp": datetime.utcnow().isoformat() + "Z"
+    })
 
-        template_name = "vera_generic_v1"
-        template_params = [merchant.get("identity", {}).get("owner_first_name", "owner")]
-        if trg.get("kind") == "research_digest":
-            template_name = "vera_research_digest_v1"
-            template_params = [
-                merchant.get("identity", {}).get("owner_first_name", "owner"),
-                trg.get("payload", {}).get("top_item_id", "")
-            ]
-        elif trg.get("kind") == "recall_due":
-            template_name = "merchant_recall_v1"
-            if customer:
-                template_params = [customer.get("identity", {}).get("name", "Customer")]
+    template_name = "vera_generic_v1"
+    template_params = [merchant.get("identity", {}).get("owner_first_name", "owner")]
+    if trg.get("kind") == "research_digest":
+        template_name = "vera_research_digest_v1"
+        template_params = [
+            merchant.get("identity", {}).get("owner_first_name", "owner"),
+            trg.get("payload", {}).get("top_item_id", "")
+        ]
+    elif trg.get("kind") == "recall_due":
+        template_name = "merchant_recall_v1"
+        if customer:
+            template_params = [customer.get("identity", {}).get("name", "Customer")]
 
-        actions.append({
-            "conversation_id": conv_id,
-            "merchant_id": merchant_id,
-            "customer_id": customer_id,
-            "send_as": composed.get("send_as", "vera"),
-            "trigger_id": trg_id,
-            "template_name": template_name,
-            "template_params": template_params,
-            "body": composed.get("body", ""),
-            "cta": composed.get("cta", "yes_stop"),
-            "suppression_key": composed.get("suppression_key", ""),
-            "rationale": composed.get("rationale", "")
-        })
+    return {
+        "conversation_id": conv_id,
+        "merchant_id": merchant_id,
+        "customer_id": customer_id,
+        "send_as": composed.get("send_as", "vera"),
+        "trigger_id": trg_id,
+        "template_name": template_name,
+        "template_params": template_params,
+        "body": composed.get("body", ""),
+        "cta": composed.get("cta", "yes_stop"),
+        "suppression_key": composed.get("suppression_key", ""),
+        "rationale": composed.get("rationale", "")
+    }
 
+
+@app.post("/v1/tick")
+async def tick(body: TickBody):
+    if not body.available_triggers:
+        return {"actions": []}
+
+    with ThreadPoolExecutor(max_workers=len(body.available_triggers)) as executor:
+        results = list(executor.map(process_trigger, body.available_triggers))
+
+    actions = [r for r in results if r is not None]
     return {"actions": actions}
 
 
