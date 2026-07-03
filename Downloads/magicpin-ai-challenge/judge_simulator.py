@@ -541,13 +541,26 @@ Send As: {action.get('send_as', 'vera')}
 
 Score each dimension 0-10 with clear reasoning. Be STRICT."""
 
-        try:
-            print_llm("Analyzing message...")
-            response = self.llm.complete(prompt, self.SYSTEM)
-            return self._parse_response(response, action)
-        except Exception as e:
-            print_warn(f"LLM error: {e}")
-            return self._fallback_score(action)
+        for attempt in range(5):
+            try:
+                print_llm("Analyzing message...")
+                response = self.llm.complete(prompt, self.SYSTEM)
+                return self._parse_response(response, action)
+            except Exception as e:
+                is_rate_limit = False
+                if hasattr(e, 'code') and e.code == 429:
+                    is_rate_limit = True
+                elif "429" in str(e):
+                    is_rate_limit = True
+                
+                if is_rate_limit and attempt < 4:
+                    backoff = (attempt + 1) * 3
+                    print_warn(f"Rate limited (429) during scoring. Retrying in {backoff}s... (Attempt {attempt+1}/5)")
+                    time.sleep(backoff)
+                    continue
+                else:
+                    print_warn(f"LLM error: {e}")
+                    return self._fallback_score(action)
 
     def _parse_response(self, response: str, action: Dict) -> ScoreResult:
         """Parse LLM JSON response."""
@@ -839,6 +852,7 @@ class JudgeSimulator:
 
             for action in actions:
                 self._score_and_display(action, verbose=False)
+                time.sleep(1.0)
 
         return True
 

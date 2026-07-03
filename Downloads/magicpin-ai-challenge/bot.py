@@ -133,83 +133,92 @@ def call_llm(system_prompt: str, prompt: str) -> Optional[str]:
     openai_key = os.environ.get("OPENAI_API_KEY")
     anthropic_key = os.environ.get("ANTHROPIC_API_KEY")
 
-    if gemini_key:
-        gemini_model = os.environ.get("GEMINI_MODEL", "gemini-3.1-flash-lite")
-        url = f"https://generativelanguage.googleapis.com/v1beta/models/{gemini_model}:generateContent?key={gemini_key}"
-        full_prompt = f"{system_prompt}\n\n{prompt}"
-        body = {
-            "contents": [{"parts": [{"text": full_prompt}]}],
-            "generationConfig": {
-                "temperature": 0.0,
-                "responseMimeType": "application/json"
-            }
-        }
+    for attempt in range(5):
         try:
-            req = urllib.request.Request(
-                url,
-                data=json.dumps(body).encode("utf-8"),
-                headers={"Content-Type": "application/json"}
-            )
-            with urllib.request.urlopen(req, timeout=25) as response:
-                res_data = json.loads(response.read().decode("utf-8"))
-                return res_data["candidates"][0]["content"]["parts"][0]["text"]
-        except Exception as e:
-            print(f"Gemini API error: {e}")
-
-    if openai_key:
-        url = "https://api.openai.com/v1/chat/completions"
-        openai_model = os.environ.get("OPENAI_MODEL", "gpt-4o-mini")
-        body = {
-            "model": openai_model,
-            "messages": [
-                {"role": "system", "content": system_prompt},
-                {"role": "user", "content": prompt}
-            ],
-            "temperature": 0.0,
-            "response_format": {"type": "json_object"}
-        }
-        try:
-            req = urllib.request.Request(
-                url,
-                data=json.dumps(body).encode("utf-8"),
-                headers={
-                    "Authorization": f"Bearer {openai_key}",
-                    "Content-Type": "application/json"
+            if gemini_key:
+                gemini_model = os.environ.get("GEMINI_MODEL", "gemini-3.1-flash-lite")
+                url = f"https://generativelanguage.googleapis.com/v1beta/models/{gemini_model}:generateContent?key={gemini_key}"
+                full_prompt = f"{system_prompt}\n\n{prompt}"
+                body = {
+                    "contents": [{"parts": [{"text": full_prompt}]}],
+                    "generationConfig": {
+                        "temperature": 0.0,
+                        "responseMimeType": "application/json"
+                    }
                 }
-            )
-            with urllib.request.urlopen(req, timeout=25) as response:
-                res_data = json.loads(response.read().decode("utf-8"))
-                return res_data["choices"][0]["message"]["content"]
-        except Exception as e:
-            print(f"OpenAI API error: {e}")
+                req = urllib.request.Request(
+                    url,
+                    data=json.dumps(body).encode("utf-8"),
+                    headers={"Content-Type": "application/json"}
+                )
+                with urllib.request.urlopen(req, timeout=25) as response:
+                    res_data = json.loads(response.read().decode("utf-8"))
+                    return res_data["candidates"][0]["content"]["parts"][0]["text"]
 
-    if anthropic_key:
-        url = "https://api.anthropic.com/v1/messages"
-        anthropic_model = os.environ.get("ANTHROPIC_MODEL", "claude-3-5-sonnet-20241022")
-        body = {
-            "model": anthropic_model,
-            "max_tokens": 1000,
-            "temperature": 0.0,
-            "system": system_prompt,
-            "messages": [{"role": "user", "content": prompt}]
-        }
-        try:
-            req = urllib.request.Request(
-                url,
-                data=json.dumps(body).encode("utf-8"),
-                headers={
-                    "x-api-key": anthropic_key,
-                    "Content-Type": "application/json",
-                    "anthropic-version": "2023-06-01"
+            if openai_key:
+                url = "https://api.openai.com/v1/chat/completions"
+                openai_model = os.environ.get("OPENAI_MODEL", "gpt-4o-mini")
+                body = {
+                    "model": openai_model,
+                    "messages": [
+                        {"role": "system", "content": system_prompt},
+                        {"role": "user", "content": prompt}
+                    ],
+                    "temperature": 0.0,
+                    "response_format": {"type": "json_object"}
                 }
-            )
-            with urllib.request.urlopen(req, timeout=25) as response:
-                res_data = json.loads(response.read().decode("utf-8"))
-                return res_data["content"][0]["text"]
-        except Exception as e:
-            print(f"Anthropic API error: {e}")
+                req = urllib.request.Request(
+                    url,
+                    data=json.dumps(body).encode("utf-8"),
+                    headers={
+                        "Authorization": f"Bearer {openai_key}",
+                        "Content-Type": "application/json"
+                    }
+                )
+                with urllib.request.urlopen(req, timeout=25) as response:
+                    res_data = json.loads(response.read().decode("utf-8"))
+                    return res_data["choices"][0]["message"]["content"]
 
-    return None
+            if anthropic_key:
+                url = "https://api.anthropic.com/v1/messages"
+                anthropic_model = os.environ.get("ANTHROPIC_MODEL", "claude-3-5-sonnet-20241022")
+                body = {
+                    "model": anthropic_model,
+                    "max_tokens": 1000,
+                    "temperature": 0.0,
+                    "system": system_prompt,
+                    "messages": [{"role": "user", "content": prompt}]
+                }
+                req = urllib.request.Request(
+                    url,
+                    data=json.dumps(body).encode("utf-8"),
+                    headers={
+                        "x-api-key": anthropic_key,
+                        "Content-Type": "application/json",
+                        "anthropic-version": "2023-06-01"
+                    }
+                )
+                with urllib.request.urlopen(req, timeout=25) as response:
+                    res_data = json.loads(response.read().decode("utf-8"))
+                    return res_data["content"][0]["text"]
+
+            return None
+
+        except Exception as e:
+            is_rate_limit = False
+            if hasattr(e, 'code') and e.code == 429:
+                is_rate_limit = True
+            elif "429" in str(e):
+                is_rate_limit = True
+            
+            if is_rate_limit and attempt < 4:
+                backoff = (attempt + 1) * 3
+                print(f"Rate limited (429) during LLM call. Retrying in {backoff}s... (Attempt {attempt+1}/5)")
+                time.sleep(backoff)
+                continue
+            else:
+                print(f"LLM API error: {e}")
+                return None
 
 
 def fallback_compose(category: Dict, merchant: Dict, trigger: Dict, customer: Optional[Dict]) -> Dict[str, Any]:
@@ -543,11 +552,15 @@ async def tick(body: TickBody):
     if not body.available_triggers:
         return {"actions": []}
 
-    with ThreadPoolExecutor(max_workers=len(body.available_triggers)) as executor:
-        results = list(executor.map(process_trigger, body.available_triggers))
+    results = []
+    for trg_id in body.available_triggers:
+        res = process_trigger(trg_id)
+        if res is not None:
+            results.append(res)
+            # Add a small delay to prevent rapid-fire requests
+            time.sleep(1.5)
 
-    actions = [r for r in results if r is not None]
-    return {"actions": actions}
+    return {"actions": results}
 
 
 @app.post("/v1/reply")
