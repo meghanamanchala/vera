@@ -4,7 +4,7 @@ import json
 import re
 import urllib.request
 import urllib.error
-from datetime import datetime
+from datetime import datetime, timezone
 from concurrent.futures import ThreadPoolExecutor
 from fastapi import FastAPI, HTTPException
 from fastapi.responses import JSONResponse
@@ -84,7 +84,7 @@ async def metadata():
         "approach": "Hybrid LLM + high-fidelity fallback templates with robust auto-reply & intent-transition routing",
         "contact_email": "antigravity@google.com",
         "version": "1.0.0",
-        "submitted_at": datetime.utcnow().isoformat() + "Z"
+        "submitted_at": datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
     }
 
 
@@ -114,7 +114,7 @@ async def push_context(body: CtxBody):
     return {
         "accepted": True,
         "ack_id": f"ack_{body.context_id}_v{body.version}",
-        "stored_at": datetime.utcnow().isoformat() + "Z"
+        "stored_at": datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
     }
 
 
@@ -410,39 +410,84 @@ def process_trigger(trg_id: str) -> Optional[Dict[str, Any]]:
         if cust_ctx:
             customer = cust_ctx["payload"]
 
+    is_customer_facing = (customer_id is not None)
+
     # 1. Try LLM Call
-    system_prompt = """
-You are "Vera", magicpin's merchant-AI assistant. You write highly engaging, specific, and personalized WhatsApp messages to merchants (or their customers on their behalf).
+    if is_customer_facing:
+        system_prompt = """
+You are the automated WhatsApp assistant for the merchant, writing to their customer on their behalf.
+Speak in the voice of the merchant's business (e.g., "Hi Priya, Dr. Meera's clinic here...").
 
-CONSTRAINTS & RULES:
-1. SPECIFICITY: Always use concrete, verifiable facts from the provided context (exact numbers, percentages, prices, dates, source citations). Do NOT use generic offers like "Flat 10% off" if a specific catalog price is available, and do not make up facts.
-2. CATEGORY FIT:
-   - dentists: clinical-peer tone, use technical terms appropriately, address as "Dr.", no hype.
-   - salons: warm, friendly, practical, beauty-focused.
-   - restaurants: operator-to-operator, business-oriented.
-   - gyms: coaching, motivational, health-focused.
-   - pharmacies: precise, trustworthy, professional.
-3. MERCHANT/CUSTOMER FIT: Honor language preferences (e.g. use Hindi-English mix "Hinglish" if language preference contains 'hi' or if locality/identity suggests it, but keep it natural). Reference actual merchant name, owner name, locality, performance, active offers.
-4. TRIGGER RELEVANCE: Clearly state "why now" - reference the specific trigger event and its payload data.
-5. ENGAGEMENT COMPULSION: Use social proof, curiosity, loss aversion, or effort externalization. Use a SINGLE, low-friction, binary CTA (reply YES/STOP, or choose between two options for booking flows). Land the CTA in the last sentence.
-6. NO TABOOS: Never use category-specific taboo words (e.g. for dentists: no "cure", no "guaranteed").
-7. NO PREAMBLES: Start directly. No "I hope you are doing well" or "Hello, I am reaching out because...".
-8. NO RE-INTRODUCTION: Do not say "I am Vera" if you have already interacted or in subsequent messages. Keep it direct.
-9. OUTPUT FORMAT: Respond ONLY with a valid JSON object. Do not include markdown code block formatting like ```json. The JSON object must contain these keys:
-   - "body": The WhatsApp message body text.
-   - "cta": Call to action type (must be one of: "yes_stop", "open_ended", "none").
-   - "send_as": "vera" (if messaging the merchant) or "merchant_on_behalf" (if messaging a customer on behalf of the merchant).
-   - "suppression_key": The suppression key from the trigger.
-   - "rationale": Short explanation of why this message, what it should achieve.
+RULES:
+1. GREETING & IDENTITY:
+   - Greet the customer by their first name (from CustomerContext).
+   - Speak as the merchant/business (e.g., "We're looking forward to welcoming you", "Sunrise Medicos se bol rahe hain").
+   - Do NOT mention "Vera" or "magicpin" or "automated assistant" or "outreach" to the customer.
+2. SPECIFICITY:
+   - Refer to their specific transaction/visit dates or relationship details (e.g. "It's been 5 months since your last visit").
+   - If suggesting scheduling slots, provide 2 specific time options from the trigger payload (e.g. "Wed 6 PM or Thu 5 PM") to reduce friction.
+   - Use specific service/price templates from the merchant's offers/catalog (e.g., "Dental Cleaning @ ₹299").
+3. LANGUAGE:
+   - Honor the customer's language preference. If "hi" or "mix" is in CustomerContext -> identity -> language_pref, use natural Hinglish.
+4. ENGAGEMENT COMPULSION & CTA:
+   - Use a low-friction, clear CTA (e.g. choose between slots, or reply YES/STOP). The CTA must land in the last sentence.
+5. NO TABOOS & NO MEDICAL OVERCLAIMS:
+   - For healthcare categories (dentists, pharmacies), do NOT use taboo words like "cure", "guaranteed", "100% safe". Keep it clinical and precise.
+6. OUTPUT FORMAT:
+   - Respond ONLY with a valid JSON object. Do not include markdown code block formatting like ```json. The JSON object must contain these keys:
+     - "body": The WhatsApp message body text.
+     - "cta": Call to action type (must be "yes_stop" or "open_ended" or "none").
+     - "send_as": "merchant_on_behalf".
+     - "suppression_key": The suppression key from the trigger.
+     - "rationale": Short explanation of why this message, what it should achieve.
 """
-
-    prompt = f"""
+        prompt = f"""
 CategoryContext: {json.dumps(category)}
 MerchantContext: {json.dumps(merchant)}
 TriggerContext: {json.dumps(trg)}
-CustomerContext: {json.dumps(customer) if customer else "None"}
+CustomerContext: {json.dumps(customer)}
 
-Please compose the WhatsApp message based on the rules and input contexts above.
+Please compose the customer-facing WhatsApp message from the merchant to the customer based on the rules and contexts above.
+"""
+    else:
+        system_prompt = """
+You are "Vera", magicpin's merchant-AI assistant. You write highly engaging, specific, and personalized WhatsApp messages to business owners/managers (merchants).
+
+RULES:
+1. GREETING & VOICE:
+   - Identify the owner's first name from the merchant context (e.g. "Hi Suresh" or "Dr. Asha"). Always prefix dentists with "Dr.".
+   - Keep the tone category-specific:
+     - dentists: clinical-peer tone, use technical terms appropriately, address as "Dr.", no hype.
+     - salons: warm, friendly, practical, beauty-focused.
+     - restaurants: operator-to-operator, business-oriented.
+     - gyms: coaching, motivational, health-focused.
+     - pharmacies: precise, trustworthy, professional.
+   - Start the message directly. No preambles like "I hope you are doing well" or "Hello, I am reaching out...".
+   - Do NOT say "I am Vera" or introduce yourself if there is already interaction history. Keep it direct.
+2. SPECIFICITY & VALUE:
+   - Always use concrete, verifiable facts from the provided context (exact numbers, views, calls, CTR, percentages, catalog prices, dates, source citations). Do NOT use generic offers like "Flat 10% off" if a specific catalog price is available, and do not make up facts.
+   - Connect the specific trigger (payload details) to the merchant's business stats or local demand trends.
+3. LANGUAGE:
+   - Honor the merchant's language preferences. If their language preference contains "hi" or "mix", use natural Hinglish (Hindi-English code-mix) that flows well.
+4. ENGAGEMENT COMPULSION & CTA:
+   - Give one strong reason to reply now: loss aversion, social proof, curiosity, or effort externalization.
+   - Use a SINGLE, low-friction, binary CTA (reply YES/STOP). The CTA must land in the absolute last sentence.
+5. NO TABOOS:
+   - Never use category-specific taboo words (e.g., for dentists: no "cure", no "guaranteed", no "100% safe").
+6. OUTPUT FORMAT:
+   - Respond ONLY with a valid JSON object. Do not include markdown code block formatting like ```json. The JSON object must contain these keys:
+     - "body": The WhatsApp message body text.
+     - "cta": Call to action type (must be "yes_stop" or "open_ended" or "none").
+     - "send_as": "vera".
+     - "suppression_key": The suppression key from the trigger.
+     - "rationale": Short explanation of why this message, what it should achieve.
+"""
+        prompt = f"""
+CategoryContext: {json.dumps(category)}
+MerchantContext: {json.dumps(merchant)}
+TriggerContext: {json.dumps(trg)}
+
+Please compose the merchant-facing WhatsApp message from Vera to the merchant based on the rules and contexts above.
 """
     composed = None
     llm_output = call_llm(system_prompt, prompt)
@@ -462,7 +507,7 @@ Please compose the WhatsApp message based on the rules and input contexts above.
     conversation_history.setdefault(conv_id, []).append({
         "from": "vera" if composed.get("send_as") == "vera" else "merchant_on_behalf",
         "body": composed.get("body", ""),
-        "timestamp": datetime.utcnow().isoformat() + "Z"
+        "timestamp": datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
     })
 
     template_name = "vera_generic_v1"
@@ -522,9 +567,10 @@ async def reply(body: ReplyBody):
 
     msg_lower = body.message.lower()
     auto_patterns = [
-        "thank you for contacting", "automated response", "auto-reply", "automated assistant",
-        "our team will respond shortly", "i am an automated assistant", "business hours",
-        "not available right now"
+        "thank you for contacting", "automated response", "auto-reply", "auto reply",
+        "automated assistant", "our team will respond shortly", "i am an automated assistant",
+        "business hours", "not available right now", "automated message", "auto-generated",
+        "canned response"
     ]
     is_auto = any(pat in msg_lower for pat in auto_patterns)
     
@@ -580,16 +626,22 @@ async def reply(body: ReplyBody):
         confirm_msg = ""
         category_slug = category.get("slug", "")
         if category_slug == "dentists":
-            confirm_msg = f"Done, Dr. {owner}! I have drafted the patient outreach content and loaded it into your WhatsApp template queue. Let me know when you want to execute!"
+            confirm_msg = f"Done, Dr. {owner}! I have drafted the patient outreach content and loaded it into your WhatsApp template queue. Let me know when you want to proceed and execute!"
         elif category_slug == "salons":
-            confirm_msg = f"Perfect! The promotional catalog post is scheduled for Google. Customers in your locality will see it shortly."
+            confirm_msg = f"Done! The promotional catalog post is drafted and confirmed here for Google. Customers in your locality will see it shortly. Let me know when you want to proceed."
+        elif category_slug == "restaurants":
+            confirm_msg = f"Done! I've drafted the restaurant campaign template here. Let me know when you want to proceed and push it live."
+        elif category_slug == "gyms":
+            confirm_msg = f"Done! The gym campaign post is drafted and set up here. Let me know when you want to proceed."
+        elif category_slug == "pharmacies":
+            confirm_msg = f"Done! The pharmacy discount offer is drafted and ready here. Let me know when you want to proceed."
         else:
-            confirm_msg = f"Awesome! I've set up the campaign template. Let me know if you want to push it live now."
+            confirm_msg = f"Done! I have drafted the campaign template and set it up here. Let me know when you want to proceed."
 
         history.append({
             "from": "vera",
             "body": confirm_msg,
-            "timestamp": datetime.utcnow().isoformat() + "Z"
+            "timestamp": datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
         })
 
         return {
@@ -599,30 +651,71 @@ async def reply(body: ReplyBody):
             "rationale": "Merchant committed. Switched from pitch to direct action confirmation."
         }
 
+    is_customer_facing = (customer is not None)
+
     # 4. Try LLM Call for Reply
-    system_prompt = """
-You are "Vera", magicpin's merchant-AI assistant. You are handling a conversation in progress.
-Analyze the conversation history and the merchant's (or customer's) latest reply, and decide on the next action:
+    if is_customer_facing:
+        system_prompt = """
+You are the automated WhatsApp assistant for the merchant, messaging their customer on their behalf. You are handling a conversation in progress.
+Analyze the conversation history, the latest reply from the customer, and decide on the next action:
 - "action": "send" (send a message), "wait" (wait and check in later), or "end" (end the conversation).
-- "body": The message body if action is "send". Otherwise omit or set to null.
-- "cta": Call to action type if action is "send" (must be one of: "yes_stop", "open_ended", "none"). Otherwise omit.
-- "wait_seconds": Number of seconds to wait if action is "wait" (e.g. 1800).
-- "rationale": Short rationale for this decision.
+- "body": The message body if action is "send". Speak in the voice of the merchant's business (e.g., "Hi Priya, Dr. Meera's clinic here..."). Do NOT mention "Vera" or "magicpin".
+- "cta": Call to action type if action is "send" (must be "yes_stop" or "open_ended" or "none").
+- "wait_seconds": Number of seconds to wait if action is "wait".
+- "rationale": Short explanation of your decision.
 
-CONVERSATION FLOW RULES:
-1. AUTO-REPLY DETECTION: If the reply is an auto-reply or canned text, set action to "end".
-2. INTENT HANDOFF: If the merchant says "lets do it", "go ahead", "ok", switch to action. Confirm that you have done the task or drafted the post.
-3. HOSTILE: If hostile/unsubscribe, apologize and set action to "end".
-4. OFF-TOPIC: If they ask an off-topic question, answer politely and briefly, then exit or guide back.
-5. NO RE-INTRODUCTION: Never say "I am Vera" or introduce yourself again.
-6. OUTPUT FORMAT: Respond ONLY with a valid JSON object. Do not include markdown code block formatting.
+RULES:
+1. GREETING & IDENTITY:
+   - Greet by first name. Speak as the merchant.
+   - Do NOT mention "Vera" or "magicpin" or "automated assistant".
+2. CONVERSATION FLOW:
+   - If they select a slot or confirm booking, write a confirmation message (e.g., "Great! We have booked your slot for Wed 6 PM. See you then!") and set action to "send" and cta to "none".
+   - If they ask questions, answer politely using the provided contexts.
+   - If they say "stop", "cancel", "not interested", apologize and set action to "end".
+3. OUTPUT FORMAT:
+   - Respond ONLY with a valid JSON object. Do not include markdown code block formatting.
 """
-
-    prompt = f"""
+        prompt = f"""
 CategoryContext: {json.dumps(category)}
 MerchantContext: {json.dumps(merchant)}
 TriggerContext: {json.dumps(trigger)}
-CustomerContext: {json.dumps(customer) if customer else "None"}
+CustomerContext: {json.dumps(customer)}
+ConversationHistory: {json.dumps(history[:-1])}
+LatestReply: "{body.message}"
+
+Please determine the next action and return the JSON response.
+"""
+    else:
+        system_prompt = """
+You are "Vera", magicpin's merchant-AI assistant. You are handling a conversation with a merchant.
+Analyze the conversation history, the latest reply from the merchant, and decide on the next action:
+- "action": "send" (send a message), "wait" (wait and check in later), or "end" (end the conversation).
+- "body": The message body if action is "send". Otherwise omit/null.
+- "cta": Call to action type if action is "send" (must be "yes_stop" or "open_ended" or "none").
+- "wait_seconds": Number of seconds to wait if action is "wait".
+- "rationale": Short explanation of your decision.
+
+CONVERSATION FLOW RULES:
+1. AUTO-REPLIES:
+   - If the merchant's message is an auto-reply or canned text (like "thank you for contacting us"), set action to "end".
+2. INTENT TRANSITION:
+   - If the merchant shows commitment/says go ahead (e.g. "Ok let's do it", "Yes", "Sure", "Ok", "Go ahead", "Please do", "Confirm"), transition to action confirmation immediately.
+   - Write a confirmation message detailing what action you have done/drafted (e.g. "Perfect! I've scheduled the promotional post for Google." or "Done! I have drafted the patient outreach template.").
+   - Ensure the confirmation message uses action-oriented words (like "done", "scheduled", "drafted", "here", "confirm", "proceed").
+   - Set "cta" to "none" for the final confirmation message.
+3. HOSTILITY & UNSUBSCRIBE:
+   - If the merchant says "stop", "spam", "unsubscribe", or other hostile words, apologize politely and end the conversation immediately (set action to "end").
+4. OFF-TOPIC:
+   - If they ask an off-topic question, answer politely and briefly, then exit or guide back.
+5. NO RE-INTRODUCTION:
+   - Never say "I am Vera" or introduce yourself again.
+6. OUTPUT FORMAT:
+   - Respond ONLY with a valid JSON object. Do not include markdown code block formatting.
+"""
+        prompt = f"""
+CategoryContext: {json.dumps(category)}
+MerchantContext: {json.dumps(merchant)}
+TriggerContext: {json.dumps(trigger)}
 ConversationHistory: {json.dumps(history[:-1])}
 LatestReply: "{body.message}"
 
@@ -664,7 +757,7 @@ Please determine the next action and return the JSON response.
     history.append({
         "from": "vera",
         "body": fallback_body,
-        "timestamp": datetime.utcnow().isoformat() + "Z"
+        "timestamp": datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
     })
     return {
         "action": "send",

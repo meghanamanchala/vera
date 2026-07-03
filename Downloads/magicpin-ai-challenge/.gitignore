@@ -1,0 +1,10 @@
+.env
+__pycache__/
+*.pyc
+.vscode/
+.gemini/
+results/
+submission.jsonl
+walkthrough.md
+implementation_plan.md
+task.md
